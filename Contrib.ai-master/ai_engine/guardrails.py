@@ -5,10 +5,11 @@ Provides comprehensive security measures for AI interactions.
 
 import re
 import logging
+import threading
+import time
 from typing import Optional, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from langchain_google_genai import ChatGoogleGenerativeAI
 import os
 from dotenv import load_dotenv
@@ -16,14 +17,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-# Initialize LLM for guardrail validation
-guardrail_llm = ChatGoogleGenerativeAI(
-    model="models/gemini-2.5-flash",
-    google_api_key=os.getenv("GEMINI_KEY"),
-    temperature=0
-)
-
 
 class InputGuardrails:
     """Validates and sanitizes user input before processing by LLM"""
@@ -52,7 +45,7 @@ class InputGuardrails:
         Returns:
             Tuple of (is_valid, error_message)
         """
-        if not query or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             return False, "Input cannot be empty"
         
         # Check length limits
@@ -65,21 +58,16 @@ class InputGuardrails:
                 logger.warning(f"Blocked potentially malicious input: {query[:100]}")
                 return False, "Input contains potentially harmful content"
         
-        # Check for excessive repetition (potential DoS)
+        # Check for long runs of the same character (potential DoS).
         if InputGuardrails._check_excessive_repetition(query):
             return False, "Input contains excessive repetition"
         
         return True, None
     
     @staticmethod
-    def _check_excessive_repetition(text: str, threshold: int = 10) -> bool:
-        """Check if text contains excessive character repetition"""
-        char_count = {}
-        for char in text:
-            char_count[char] = char_count.get(char, 0) + 1
-            if char_count[char] > threshold:
-                return True
-        return False
+    def _check_excessive_repetition(text: str, threshold: int = 50) -> bool:
+        """Check for an unusually long run of one repeated character."""
+        return re.search(r"(.)\1{%d,}" % threshold, text) is not None
     
     @staticmethod
     def sanitize_input(query: str) -> str:
@@ -105,7 +93,7 @@ class OutputGuardrails:
         Returns:
             Tuple of (is_valid, error_message)
         """
-        if not output:
+        if not isinstance(output, str) or not output.strip():
             return False, "Empty output from LLM"
         
         # Check for code injection in output
@@ -163,6 +151,11 @@ class LLMGuardrailChain:
         """
         
         self.safety_prompt = ChatPromptTemplate.from_template(self.safety_template)
+        guardrail_llm = ChatGoogleGenerativeAI(
+            model="models/gemini-2.5-flash",
+            google_api_key=os.getenv("GEMINI_KEY"),
+            temperature=0
+        )
         self.safety_chain = (
             self.safety_prompt 
             | guardrail_llm 
@@ -269,6 +262,7 @@ class RateLimiter:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self.requests = {}  # In production, use Redis or similar
+        self._lock = threading.Lock()
     
     def is_allowed(self, user_id: str) -> tuple[bool, Optional[str]]:
         """
@@ -280,23 +274,21 @@ class RateLimiter:
         Returns:
             Tuple of (is_allowed, error_message)
         """
-        import time
         current_time = time.time()
-        
-        if user_id not in self.requests:
-            self.requests[user_id] = []
-        
-        # Remove old requests outside the time window
-        self.requests[user_id] = [
-            req_time for req_time in self.requests[user_id]
-            if current_time - req_time < self.window_seconds
-        ]
-        
-        if len(self.requests[user_id]) >= self.max_requests:
-            return False, f"Rate limit exceeded: {self.max_requests} requests per {self.window_seconds} seconds"
-        
-        self.requests[user_id].append(current_time)
-        return True, None
+        with self._lock:
+            if user_id not in self.requests:
+                self.requests[user_id] = []
+
+            self.requests[user_id] = [
+                req_time for req_time in self.requests[user_id]
+                if current_time - req_time < self.window_seconds
+            ]
+
+            if len(self.requests[user_id]) >= self.max_requests:
+                return False, f"Rate limit exceeded: {self.max_requests} requests per {self.window_seconds} seconds"
+
+            self.requests[user_id].append(current_time)
+            return True, None
 
 
 # Convenience function for quick integration
